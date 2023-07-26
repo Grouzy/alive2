@@ -27,7 +27,7 @@ namespace smt {
 
 context ctx;
 
-void context::init() {
+void context::initialize() {
   Z3_global_param_set("model.partial", "true");
   Z3_global_param_set("smt.ematching", "false");
   Z3_global_param_set("smt.mbqi.max_iterations", "1000000");
@@ -42,8 +42,8 @@ void context::init() {
 
   no_timeout_param = Z3_mk_params(ctx);
   Z3_params_inc_ref(ctx, no_timeout_param);
-  Z3_params_set_uint(ctx, no_timeout_param,
-                     Z3_mk_string_symbol(ctx, "timeout"), 0);
+  Z3_params_set_uint(ctx, no_timeout_param, Z3_mk_string_symbol(ctx, "timeout"),
+                     0);
 }
 
 void context::destroy() {
@@ -51,8 +51,7 @@ void context::destroy() {
   Z3_del_context(ctx);
 }
 
-}
-
+} // namespace smt
 
 // close log file on program exit
 namespace {
@@ -63,4 +62,4 @@ struct close_log {
 };
 
 close_log close;
-}
+} // namespace

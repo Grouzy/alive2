@@ -30,7 +30,7 @@ smt_initializer::~smt_initializer() {
 }
 
 void smt_initializer::init() {
-  ctx.init();
+  ctx.initialize();
   solver_init();
 }
 
@@ -38,7 +38,6 @@ void smt_initializer::destroy() {
   solver_destroy();
   ctx.destroy();
 }
-
 
 static string query_timeout = "10000";
 static string rand_seed = "0";
@@ -51,14 +50,13 @@ void set_random_seed(string seed) {
   rand_seed = std::move(seed);
 }
 
-const char* get_query_timeout() {
+const char *get_query_timeout() {
   return query_timeout.c_str();
 }
 
 const char *get_random_seed() {
   return rand_seed.c_str();
 }
-
 
 static uint64_t z3_memory_limit = 1ull << 30; // 1 GB
 
@@ -80,4 +78,4 @@ void start_logging(const char *path) {
   Z3_append_log(str.c_str());
 }
 
-}
+} // namespace smt

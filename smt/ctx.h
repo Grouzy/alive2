@@ -4,7 +4,7 @@
 // Distributed under the MIT license that can be found in the LICENSE file.
 
 typedef struct _Z3_context *Z3_context;
-typedef struct _Z3_params* Z3_params;
+typedef struct _Z3_params *Z3_params;
 
 namespace smt {
 
@@ -13,13 +13,17 @@ class context {
   Z3_params no_timeout_param;
 
 public:
-  Z3_context operator()() const { return ctx; }
-  Z3_params getNoTimeoutParam() const { return no_timeout_param; }
+  Z3_context operator()() const {
+    return ctx;
+  }
+  Z3_params getNoTimeoutParam() const {
+    return no_timeout_param;
+  }
 
-  void init();
+  void initialize();
   void destroy();
 };
 
 extern context ctx;
 
-}
+} // namespace smt
