@@ -118,8 +118,7 @@ private:
   std::set<smt::expr> nondet_vars;
 
   // var -> ((value, not_poison), ub, undef_vars)
-  std::unordered_map<const Value*, unsigned> values_map;
-  std::vector<std::pair<const Value*, ValTy>> values;
+  std::unordered_map<const Value*, ValTy> values;
 
   // dst BB -> src BB -> BasicBlockInfo
   std::unordered_map<const BasicBlock*,
@@ -212,8 +211,12 @@ public:
   const StateValue& getVal(const Value &val, bool is_poison_ub);
   const smt::expr& getWellDefinedPtr(const Value &val);
 
-  const ValTy& at(const Value &val) const;
+  const ValTy* at(const Value &val) const;
   bool isUndef(const smt::expr &e) const;
+
+  // only used by alive-exec to support execution of the same BB multiple times
+  void cleanup(const Value &val);
+  void cleanupPredecessorData();
 
   /*--- Control flow ---*/
   const smt::OrExpr* jumpCondFrom(const BasicBlock &bb) const;
@@ -277,7 +280,6 @@ public:
   auto& getPre() const { return precondition; }
   auto& getFnPre() const { return fn_call_pre; }
   auto& getUnreachable() const { return unreachable_paths; }
-  const auto& getValues() const { return values; }
   const auto& getQuantVars() const { return quantified_vars; }
   const auto& getNondetVars() const { return nondet_vars; }
   const auto& getFnQuantVars() const { return fn_call_qvars; }
