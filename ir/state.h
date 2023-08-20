@@ -280,6 +280,7 @@ public:
   auto& getPre() const { return precondition; }
   auto& getFnPre() const { return fn_call_pre; }
   auto& getUnreachable() const { return unreachable_paths; }
+  const auto& getValues() const { return values; }
   const auto& getQuantVars() const { return quantified_vars; }
   const auto& getNondetVars() const { return nondet_vars; }
   const auto& getFnQuantVars() const { return fn_call_qvars; }
