@@ -473,6 +473,14 @@ static StateValue bytesToValue(const Memory &m, const vector<Byte> &bytes,
                                const Type &toType) {
   assert(!bytes.empty());
 
+  auto ub_pre = [&](expr &&e) -> expr {
+    if (config::disallow_ub_exploitation) {
+      m.getState().addPre(std::move(e));
+      return true;
+    }
+    return std::move(e);
+  };
+
   if (toType.isPtrType()) {
     assert(bytes.size() == bits_program_pointer / bits_byte);
     expr loaded_ptr, is_ptr;
@@ -493,12 +501,13 @@ static StateValue bytesToValue(const Memory &m, const vector<Byte> &bytes,
         loaded_ptr = ptr_value;
         is_ptr     = std::move(b_is_ptr);
       } else {
-        non_poison &= is_ptr == b_is_ptr;
+        non_poison &= ub_pre(is_ptr == b_is_ptr);
       }
+
       non_poison &=
-        expr::mkIf(is_ptr,
-                   b.ptrByteoffset() == i && ptr_value == loaded_ptr,
-                   b.nonptrValue() == 0);
+        ub_pre(expr::mkIf(is_ptr,
+                          b.ptrByteoffset() == i && ptr_value == loaded_ptr,
+                          b.nonptrValue() == 0));
       non_poison &= !b.isPoison();
     }
 
@@ -526,12 +535,13 @@ static StateValue bytesToValue(const Memory &m, const vector<Byte> &bytes,
     IntType ibyteTy("", bits_byte);
 
     for (auto &b: bytes) {
+      expr isptr = ub_pre(!b.isPtr());
       StateValue v(b.nonptrValue(),
-                   ibyteTy.combine_poison(!b.isPtr(), b.nonptrNonpoison()));
+                   ibyteTy.combine_poison(isptr, b.nonptrNonpoison()));
       val = first ? std::move(v) : v.concat(val);
       first = false;
     }
-    return toType.fromInt(val.trunc(bitsize, toType.np_bits()));
+    return toType.fromInt(val.trunc(bitsize, toType.np_bits(true)));
   }
 }
 
@@ -1078,7 +1088,7 @@ void Memory::mkNonlocalValAxioms(bool skip_consts) {
   if (config::disable_poison_input && state->isSource() &&
       (does_int_mem_access || does_ptr_mem_access)) {
     for (auto &block : non_local_block_val) {
-      if (isInitialMemBlock(block.val))
+      if (isInitialMemBlock(block.val, config::disallow_ub_exploitation))
         state->addAxiom(
           expr::mkForAll({ offset },
                          !Byte(*this, block.val.load(offset)).isPoison()));
@@ -1157,8 +1167,10 @@ Memory::Memory(State &state) : state(&state), escaped_local_blks(*this) {
   }
 
   // Initialize a memory block for null pointer.
-  if (skip_null)
-    alloc(expr::mkUInt(0, bits_size_t), bits_byte / 8, GLOBAL, false, false, 0);
+  if (skip_null) {
+    auto zero = expr::mkUInt(0, bits_size_t);
+    alloc(&zero, bits_byte / 8, GLOBAL, false, false, 0);
+  }
 }
 
 void Memory::mkAxioms(const Memory &tgt) const {
@@ -1210,17 +1222,22 @@ void Memory::mkAxioms(const Memory &tgt) const {
     state->addAxiom(Pointer::mkNullPointer(*this).getAddress(false) == 0);
 
   // Non-local blocks are disjoint.
+  auto one = expr::mkUInt(1, bits_ptr_address);
   for (unsigned bid = 0; bid < num_nonlocals; ++bid) {
     if (skip_bid(bid))
       continue;
 
-    Pointer p1(*this, bid, false);
+    Pointer p1(bid < num_nonlocals_src ? *this : tgt, bid, false);
     auto addr  = p1.getAddress();
     auto sz    = p1.blockSize().zextOrTrunc(bits_ptr_address);
     auto align = p1.blockAlignment();
 
     if (!has_null_block || bid != 0)
       state->addAxiom(addr != 0);
+
+    // address must be properly aligned
+    state->addAxiom(
+      (addr & ((one << align.zextOrTrunc(bits_ptr_address)) - one)) == 0);
 
     state->addAxiom(
       Pointer::hasLocalBit()
@@ -1232,7 +1249,7 @@ void Memory::mkAxioms(const Memory &tgt) const {
     for (unsigned bid2 = bid + 1; bid2 < num_nonlocals; ++bid2) {
       if (skip_bid(bid2))
         continue;
-      Pointer p2(*this, bid2, false);
+      Pointer p2(bid2 < num_nonlocals_src ? *this : tgt, bid2, false);
       state->addAxiom(disjoint(addr, sz, align, p2.getAddress(),
                                p2.blockSize().zextOrTrunc(bits_ptr_address),
                                p2.blockAlignment()));
@@ -1541,6 +1558,20 @@ void Memory::setState(const Memory::CallState &st,
   }
 
   mkNonlocalValAxioms(true);
+
+  // TODO: havoc local blocks
+  // for now, zero out if in non UB-exploitation mode to avoid false positives
+  if (config::disallow_ub_exploitation) {
+    expr raw_byte = Byte(*this, {expr::mkUInt(0, bits_byte), true})();
+    expr array = expr::mkConstArray(expr::mkUInt(0, bits_for_offset),
+                                    raw_byte);
+
+    for (unsigned i = 0; i < next_local_bid; ++i) {
+      if (escaped_local_blks.mayAlias(true, i)) {
+        local_block_val[i] = expr(array);
+      }
+    }
+  }
 }
 
 static expr disjoint_local_blocks(const Memory &m, const expr &addr,
@@ -1601,7 +1632,7 @@ void Memory::mkLocalDisjAddrAxioms(const expr &allocated, const expr &short_bid,
 }
 
 pair<expr, expr>
-Memory::alloc(const expr &size, uint64_t align, BlockKind blockKind,
+Memory::alloc(const expr *size, uint64_t align, BlockKind blockKind,
               const expr &precond, const expr &nonnull,
               optional<unsigned> bidopt, unsigned *bid_out) {
   assert(!memory_unused());
@@ -1622,9 +1653,14 @@ Memory::alloc(const expr &size, uint64_t align, BlockKind blockKind,
   if (bid_out)
     *bid_out = bid;
 
-  expr size_zext = size.zextOrTrunc(bits_size_t);
-  expr nooverflow = size.bits() <= bits_size_t ? true :
-                      size.extract(size.bits()-1, bits_size_t) == 0;
+  expr size_zext;
+  expr nooverflow = true;
+  if (size) {
+    size_zext  = size->zextOrTrunc(bits_size_t);
+    nooverflow = size->bits() <= bits_size_t ? true :
+                   size->extract(size->bits()-1, bits_size_t) == 0;
+  }
+
 
   expr allocated = precond && nooverflow;
   state->addPre(nonnull.implies(allocated));
@@ -1649,15 +1685,17 @@ Memory::alloc(const expr &size, uint64_t align, BlockKind blockKind,
   bool is_null = !is_local && has_null_block && bid == 0;
 
   if (is_local) {
+    assert(size);
     mkLocalDisjAddrAxioms(allocated, short_bid, size_zext, align_expr,
                           align_bits);
   } else {
-    state->addAxiom(p.blockSize() == size_zext);
+    // support for 0-sized arrays like [0 x i8], which are arbitrarily sized
+    if (size)
+      state->addAxiom(p.blockSize() == size_zext);
+    else
+      state->addAxiom(p.blockSize().uge(1));
     state->addAxiom(p.isBlockAligned(align, true));
     state->addAxiom(p.getAllocType() == alloc_ty);
-
-    if (align_bits && observesAddresses())
-      state->addAxiom(p.getAddress().extract(align_bits - 1, 0) == 0);
 
     assert(is_const == is_constglb(bid, state->isSource()));
     assert((has_null_block && bid == 0) ||
@@ -1666,8 +1704,9 @@ Memory::alloc(const expr &size, uint64_t align, BlockKind blockKind,
 
   if (!is_null)
     store_bv(p, allocated, local_block_liveness, non_local_block_liveness);
-  (is_local ? local_blk_size : non_local_blk_size)
-    .add(short_bid, std::move(size_zext));
+  if (size)
+    (is_local ? local_blk_size : non_local_blk_size)
+      .add(short_bid, std::move(size_zext));
   (is_local ? local_blk_align : non_local_blk_align)
     .add(short_bid, std::move(align_expr));
   (is_local ? local_blk_kind : non_local_blk_kind)
@@ -2281,6 +2320,8 @@ void Memory::print(ostream &os, const Model &m) const {
       P("alloc type", p.getAllocType());
       if (observesAddresses())
         P("address", p.getAddress());
+      if (!local && is_constglb(bid))
+        os << "\tconst";
       os << '\n';
     }
   };

@@ -100,8 +100,9 @@ void tools::print_model_val(ostream &os, const State &st, const Model &m,
 using print_var_val_ty = function<void(ostream&, const Model&)>;
 
 static bool error(Errors &errs, const State &src_state, const State &tgt_state,
-                  const Result &r, const Value *var, const char *msg,
-                  bool check_each_var, print_var_val_ty print_var_val) {
+                  const Result &r, Solver &solver, const Value *var,
+                  const char *msg, bool check_each_var,
+                  print_var_val_ty print_var_val) {
 
   if (r.isInvalid()) {
     errs.add("Invalid expr", false);
@@ -126,16 +127,16 @@ static bool error(Errors &errs, const State &src_state, const State &tgt_state,
   stringstream s;
   string empty;
   auto &var_name = var ? var->getName() : empty;
-  auto &m = r.getModel();
 
   {
     // filter out approximations that don't contribute to the bug
     // i.e., they don't show up in the SMT model
+    auto &m = r.getModel();
     set<string> approx;
     for (auto *v : { &src_state.getApproximations(),
                      &tgt_state.getApproximations() }) {
       for (auto &[msg, var] : *v) {
-        if (!var || m.hasFnModel(*var))
+        if (!var || m.hasFnModel(*var) || var->isConst())
           approx.emplace(msg);
       }
     }
@@ -152,6 +153,69 @@ static bool error(Errors &errs, const State &src_state, const State &tgt_state,
       return false;
     }
   }
+
+  // minimize the model
+  optional<Result> newr;
+
+  auto try_reduce = [&](const expr &e) {
+    bool ok = false;
+    {
+      SolverPush push(solver);
+      solver.add(e);
+      auto tmpr = solver.check();
+      if (tmpr.isSat()) {
+        ok   = true;
+        newr = std::move(tmpr);
+      }
+    }
+    //if (ok) cout << "SIMPL: " << e << '\n';
+    if (ok)
+      solver.add(e);
+    return ok;
+  };
+
+  function<void(const expr&)> reduce = [&](const expr &var) {
+    if (var.isBV()) {
+      if (!try_reduce(var == 0)) {
+        auto bw = var.bits();
+        if (bw > 4 && try_reduce(var.ule(0xf)))
+          return;
+        if (bw > 8 && try_reduce(var.ule(0xff)))
+          return;
+
+        // this *may* be a pointer
+        if (bw == Pointer::totalBits()) {
+          Pointer p(src_state.getMemory(), var);
+          reduce(p.getOffset());
+        }
+      }
+    } else if (var.isFloat()) {
+      if (!try_reduce(var.foeq(expr::mkFloat(0.0, var)))) {
+        try_reduce(!var.isNaN());
+        try_reduce(!var.isInf());
+        try_reduce(var.fole(expr::mkFloat(3.0, var)));
+        try_reduce(var.foge(expr::mkFloat(-3.0, var)));
+      }
+    } else if (var.isBool()) {
+      try_reduce(var);
+    }
+  };
+
+  for (const auto &[var, value] : r.getModel()) {
+    reduce(var);
+  }
+
+  // reduce functions. They are a map inputs -> output + else clause
+  // We ignore the else clause as it's not easy to do something with it.
+  for (const auto &[fn, interp] : r.getModel().getFns()) {
+    for (const auto &[var, value] : interp) {
+      reduce(var);
+    }
+  }
+
+  // now reduce memory-related stuff, like addresses and block sizes
+
+  auto &m = (newr ? &*newr : &r)->getModel();
 
   s << msg;
   if (!var_name.empty())
@@ -505,10 +569,13 @@ check_refinement(Errors &errs, const Transform &t, State &src_state,
   };
 
   auto check = [&](expr &&e, auto &&printer, const char *msg) {
-    e = mk_fml(std::move(e));
-    auto res = check_expr(e);
+    Solver s;
+    s.add(mk_fml(std::move(e)));
+    e = expr();
+    auto res = s.check();
+
     if (!res.isUnsat() &&
-        !error(errs, src_state, tgt_state, res, var, msg, check_each_var,
+        !error(errs, src_state, tgt_state, res, s, var, msg, check_each_var,
                printer))
       return false;
     return true;
@@ -522,21 +589,21 @@ check_refinement(Errors &errs, const Transform &t, State &src_state,
     if (!null_is_dereferenceable)
       errs.add("Null is not dereferenceable", false);
 
-    CHECK(!src_state.getGuardableUB(), [](ostream&, const Model&){},
-          "Source has guardable UB");
-    CHECK(!tgt_state.getGuardableUB(), [](ostream&, const Model&){},
-          "Target has guardable UB");
+    CHECK(retdom_a && src_state.getGuardableUB(),
+          [](ostream&, const Model&){}, "Source has guardable UB");
+    CHECK(retdom_a && retdom_b && tgt_state.getGuardableUB(),
+          [](ostream&, const Model&){}, "Target has guardable UB");
+
+    // disallow reaching unreachable instructions
+    CHECK(src_state.getUnreachable()(),
+          [](ostream&, const Model&){}, "Source has reachable unreachable");
+    CHECK(tgt_state.getUnreachable()(),
+          [](ostream&, const Model&){}, "Target has reachable unreachable");
   }
 
   // 1. Check UB
   CHECK(fndom_a.notImplies(fndom_b),
         [](ostream&, const Model&){}, "Source is more defined than target");
-
-  if (config::disallow_ub_exploitation) {
-    // disallow refinement by unreachable
-    CHECK(tgt_state.getUnreachable()().notImplies(src_state.getUnreachable()()),
-          [](ostream&, const Model&){}, "Target introduces unreachable BB");
-  }
 
   // 2. Check return domain (noreturn check)
   {
@@ -547,8 +614,7 @@ check_refinement(Errors &errs, const Transform &t, State &src_state,
       dom_constr = (fndom_a && fndom_b) && retdom_a != retdom_b;
     }
 
-    CHECK(std::move(dom_constr),
-          [](ostream&, const Model&){},
+    CHECK(std::move(dom_constr), [](ostream&, const Model&){},
           "Source and target don't have the same return domain");
   }
 
